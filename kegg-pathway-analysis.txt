@@ -1,0 +1,179 @@
+#!/usr/bin/env Rscript
+
+# KEGG Pathway Analysis with Integration of Transcriptome and Metabolome Data
+# Required packages
+required_packages <- c("pathview", "org.Mm.eg.db", "AnnotationDbi")
+for (pkg in required_packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+        install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+}
+
+#' Process Transcriptome Data
+#' @param file_path Path to transcriptome data CSV file
+#' @param organism_db Organism database (e.g., org.Mm.eg.db for mouse)
+#' @return Matrix of fold changes with Entrez IDs as rownames
+process_transcriptome_data <- function(file_path, organism_db) {
+    gene_data <- read.csv(file_path)
+    
+    # Convert Ensembl IDs to Entrez IDs
+    entrez_ids <- mapIds(organism_db,
+                        keys = gene_data$ensembl_ID,
+                        column = "ENTREZID",
+                        keytype = "ENSEMBL",
+                        multiVals = "first")
+    
+    # Create FC matrix
+    gene_fc_matrix <- cbind(
+        IP_Dox6d = gene_data$IP_Dox6d.IP_3d_log2FC,
+        EG_Dox6d = gene_data$EG_Dox6d.IP_3d_log2FC,
+        Myc_binding = gene_data$MYC_Max_binding_gene
+    )
+    rownames(gene_fc_matrix) <- entrez_ids
+    gene_fc_matrix <- gene_fc_matrix[!is.na(rownames(gene_fc_matrix)), ]
+    
+    return(gene_fc_matrix)
+}
+
+#' Process Metabolome Data
+#' @param file_path Path to metabolome data CSV file
+#' @param control_cols Column indices for control samples
+#' @param treatment_cols List of column indices for each treatment timepoint
+#' @return Matrix of log2 fold changes
+process_metabolome_data <- function(file_path, control_cols, treatment_cols) {
+    # Read data
+    data_raw <- read.csv(file_path, header = TRUE, skip = 1, row.names = 1, check.names = FALSE)
+    
+    # Handle N.D. values
+    find_min_non_nd <- function(x) {
+        numeric_values <- as.numeric(x[x != "N.D."])
+        return(min(numeric_values))
+    }
+    
+    convert_to_numeric <- function(x) {
+        min_val <- find_min_non_nd(x)
+        x[x == "N.D."] <- min_val/2
+        return(as.numeric(x))
+    }
+    
+    data_matrix <- apply(data_raw, 2, convert_to_numeric)
+    rownames(data_matrix) <- rownames(data_raw)
+    
+    # Calculate fold changes
+    control_mean <- rowMeans(data_matrix[, control_cols, drop=FALSE])
+    fc_matrix <- matrix(nrow = nrow(data_matrix), ncol = length(treatment_cols))
+    colnames(fc_matrix) <- names(treatment_cols)
+    
+    for (i in seq_along(treatment_cols)) {
+        treatment_mean <- rowMeans(data_matrix[, treatment_cols[[i]], drop=FALSE])
+        fc_matrix[,i] <- log2(treatment_mean/control_mean)
+    }
+    
+    rownames(fc_matrix) <- rownames(data_matrix)
+    return(fc_matrix)
+}
+
+#' Generate Pathway Visualizations
+#' @param gene_fc_matrix Transcriptome fold change matrix
+#' @param cpd_fc_matrix Metabolome fold change matrix
+#' @param pathway_list Data frame containing pathway IDs and names
+#' @param output_dir Output directory path
+#' @param species KEGG species code (e.g., "mmu" for mouse)
+generate_pathway_maps <- function(gene_fc_matrix, cpd_fc_matrix, pathway_list, 
+                                output_dir, species = "mmu") {
+    if(!dir.exists(output_dir)) {
+        dir.create(output_dir, recursive = TRUE)
+    }
+    
+    for(i in 1:nrow(pathway_list)) {
+        pid <- sprintf("%s%05d", species, as.integer(pathway_list$pathway_id[i]))
+        pathway_name <- pathway_list$pathway_name[i]
+        
+        # Create pathway directory
+        pathway_dir <- file.path(output_dir, pathway_name)
+        if(!dir.exists(pathway_dir)) {
+            dir.create(pathway_dir)
+        }
+        
+        # Change working directory
+        old_wd <- getwd()
+        setwd(pathway_dir)
+        
+        # Generate pathway visualization
+        tryCatch({
+            pathview(
+                gene.data = gene_fc_matrix,
+                cpd.data = cpd_fc_matrix,
+                pathway.id = pid,
+                species = species,
+                limit = list(gene = 2, cpd = 4),
+                bins = list(gene = 20, cpd = 20),
+                multi.state = TRUE,
+                same.layer = FALSE,
+                out.suffix = "integrated_analysis",
+                kegg.native = TRUE,
+                cpd.idtype = "kegg",
+                gene.idtype = "entrez",
+                low = list(gene = "green", cpd = "blue"),
+                mid = list(gene = "gray", cpd = "gray"),
+                high = list(gene = "magenta", cpd = "yellow"),
+                node.sum = "mean",
+                plot.col.key = FALSE
+            )
+            message("Successfully processed pathway: ", pid)
+        }, error = function(e) {
+            warning("Error processing pathway: ", pid, "\n", e$message)
+        })
+        
+        setwd(old_wd)
+    }
+}
+
+#' Main execution function
+#' @param config List containing configuration parameters
+main <- function(config) {
+    # Process transcriptome data
+    gene_fc_matrix <- process_transcriptome_data(
+        config$transcriptome_file,
+        config$organism_db
+    )
+    
+    # Process metabolome data
+    cpd_fc_matrix <- process_metabolome_data(
+        config$metabolome_file,
+        config$control_cols,
+        config$treatment_cols
+    )
+    
+    # Read pathway list
+    pathway_list <- read.csv(config$pathway_list_file)
+    
+    # Generate pathway visualizations
+    generate_pathway_maps(
+        gene_fc_matrix,
+        cpd_fc_matrix,
+        pathway_list,
+        config$output_dir,
+        config$species
+    )
+}
+
+# Example configuration
+config <- list(
+    transcriptome_file = "path/to/transcriptome_data.csv",
+    metabolome_file = "path/to/metabolome_data.csv",
+    pathway_list_file = "path/to/pathway_list.csv",
+    output_dir = "path/to/output",
+    organism_db = org.Mm.eg.db,
+    species = "mmu",
+    control_cols = 1:4,
+    treatment_cols = list(
+        Dox2d = 5:8,
+        Dox4d = 9:12,
+        Dox6d = 13:16
+    )
+)
+
+# Uncomment to run the analysis
+# main(config)
